@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=bluetoothtransfer
+Exec=/usr/share/bluetoothtransfer/bluetoothtransfer
+Icon=/usr/share/bluetoothtransfer/bluetooth.png
+Categories=Utility;

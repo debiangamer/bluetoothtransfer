@@ -1,0 +1,5 @@
+bluetoothtransfer (1.0-1) unstable; urgency=medium
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- xfce <xfce@ryzen5pc>  Thu, 01 Feb 2018 05:40:29 +0200

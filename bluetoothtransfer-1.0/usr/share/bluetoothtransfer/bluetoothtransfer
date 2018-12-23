@@ -1,0 +1,393 @@
+#!/usr/bin/python
+from __future__ import absolute_import, print_function, unicode_literals
+
+import gi
+gi.require_version('Gtk', '3.0')
+import webbrowser
+from gi.repository import Gtk
+from gi.repository import GObject
+import os.path
+import sys
+import dbus
+import dbus.service
+from subprocess import check_output
+from dbus.mainloop.glib import DBusGMainLoop
+
+BUS_NAME = 'org.bluez.obex'
+PATH = '/org/bluez/obex'
+BLUEZAGENT_INTERFACE = 'org.bluez.Agent1'
+AGENT_MANAGER_INTERFACE = 'org.bluez.obex.AgentManager1'
+AGENT_INTERFACE = 'org.bluez.obex.Agent1'
+CLIENT_INTERFACE='org.bluez.obex.Client1'
+TRANSFER_INTERFACE = 'org.bluez.obex.Transfer1'
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
+SESSION_INTERFACE='org.bluez.obex.Session1'
+OBJECT_PUSH_INTERFACE='org.bluez.obex.ObjectPush1'
+
+DBusGMainLoop(set_as_default=True)
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+class AskDlg(Gtk.Dialog):
+    def __init__(self, prompt, pin=False, parent=None):
+        Gtk.Dialog.__init__(self, "Confirm", parent, 0,
+            (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+             Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        self.set_default_size(150, 100)
+        label = Gtk.Label(prompt)
+        box = self.get_content_area()
+        box.add(label)
+        if (pin == True):
+            self.entry = Gtk.Entry()
+            box.add(self.entry)
+        self.show_all()
+
+def ask(prompt, pin=False):
+    ret = None
+    dialog = AskDlg(prompt, pin)
+    response = dialog.run()
+    if (pin == True):
+        ret = dialog.entry.get_text()
+    dialog.destroy()
+    if (pin == False):
+        return response
+    else:
+        #print ("pin= " + ret)
+        return ret
+
+def set_trusted(path):
+    props = dbus.Interface(dbus.SystemBus().get_object("org.bluez", path),
+                    "org.freedesktop.DBus.Properties")
+    props.Set("org.bluez.Device1", "Trusted", True)
+
+class BluezAgent(dbus.service.Object):
+    
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="", out_signature="")
+    def Release(self):
+        return
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        authorize = ask("Authorize connection? " + str(device))
+        if (authorize == Gtk.ResponseType.OK):
+            return
+        raise Rejected("Connection rejected by user")
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        set_trusted(device)
+        return ask("Enter PIN Code: ", pin=True)
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        set_trusted(device)
+        passkey = ask("Enter passkey: ", pin=True)
+        return dbus.UInt32(passkey)
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        #print("DisplayPasskey (%s, %06u entered %u)" %
+        #                (device, passkey, entered))
+        authorize = ask("Authorize Passkey? " + str(passkey))
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        #print("DisplayPinCode (%s, %s)" % (device, pincode))
+        authorize = ask("Authorize Pincode? " + str(pincode))
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        #print("RequestConfirmation (%s, %06d)" % (device, passkey))
+        resp = ask("Confirm passkey? " + str(passkey))
+        if (resp == Gtk.ResponseType.OK):
+            set_trusted(device)
+            return
+        raise Rejected("Passkey doesn't match")
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        #print("RequestAuthorization (%s)" % (device))
+        auth = ask("Authorize? " + str(device))
+        if (auth == Gtk.ResponseType.OK):
+            return
+        raise Rejected("Pairing rejected")
+
+    @dbus.service.method(BLUEZAGENT_INTERFACE,
+                    in_signature="", out_signature="")
+    def Cancel(self):
+        return
+
+class Adapter():
+    def get_managed_objects(self):
+        manager = dbus.Interface(self.bus.get_object("org.bluez", "/"),
+                    "org.freedesktop.DBus.ObjectManager")
+        return manager.GetManagedObjects()
+
+    def find_adapter(self,pattern=None):
+        return self.find_adapter_in_objects(self.get_managed_objects(), pattern)
+
+    def find_adapter_in_objects(self,objects, pattern=None):
+        for path, ifaces in objects.items():
+            adapter = ifaces.get(ADAPTER_INTERFACE)
+            if adapter is None:
+                continue
+            if not pattern or pattern == adapter["Address"] or \
+                                path.endswith(pattern):
+                obj = self.bus.get_object("org.bluez", path)
+                return dbus.Interface(obj, ADAPTER_INTERFACE)
+        raise Exception("Bluetooth adapter not found")
+    
+    def __init__(self):
+        self.bus = dbus.SystemBus()
+        adapter_path = self.find_adapter("hci0").object_path
+        adapter = dbus.Interface(self.bus.get_object("org.bluez", adapter_path),
+                    "org.freedesktop.DBus.Properties")
+        adapter.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
+        adapter.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(1))
+    
+    def get_devices(self):
+        path = self.find_adapter("hci0").object_path
+        all_devices = (str(path) for path, interfaces in self.get_managed_objects().items() if
+                    "org.bluez.Device1" in interfaces.keys())
+        device_list = [d for d in all_devices if d.startswith(path + "/")]
+        list = []
+        for dev_path in device_list:
+            dev = self.get_managed_objects()[dev_path]
+            properties = dev["org.bluez.Device1"]
+            dict = (properties["Alias"],properties["Address"])
+            list.append(dict)   
+        return list
+
+    def discover(self):
+        adapter = self.find_adapter("hci0")
+        adapter.StartDiscovery()
+
+
+class Agent(dbus.service.Object):
+    def __init__(self, conn=None, obj_path=None):
+        dbus.service.Object.__init__(self, conn, obj_path)
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o",out_signature="s")
+    def AuthorizePush(self, path):   
+        self.dbus_proxy = dbus.SessionBus().get_object(BUS_NAME, path)
+        self.transfer = dbus.Interface(self.dbus_proxy,'org.freedesktop.DBus.Properties')
+        properties = self.transfer.GetAll(TRANSFER_INTERFACE);
+        label.set_text('Downloading to: ~/.cache/obexd/' +properties['Name'])
+        return properties['Name']
+        
+    @dbus.service.method(AGENT_INTERFACE, in_signature="",out_signature="")
+    def Cancel(self):
+        label.set_text("Authorization Canceled")
+     
+    @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
+    def Release(self):
+         return
+
+class OppClient:
+    def __init__(self, session_path):
+        self.transferred = 0
+        self.transfer_path = None
+        bus = dbus.SessionBus()
+        obj = bus.get_object(BUS_NAME, session_path)
+        self.session = dbus.Interface(obj, SESSION_INTERFACE)
+        self.opp = dbus.Interface(obj, OBJECT_PUSH_INTERFACE)
+        bus.add_signal_receiver(self.properties_changed,
+            dbus_interface="org.freedesktop.DBus.Properties",
+            signal_name="PropertiesChanged",
+            path_keyword="path")
+
+    def create_transfer_reply(self, path, properties):
+        self.transfer_path = path
+        self.transfer_size = properties["Size"]
+        
+    def error(self, err):
+        label.set_text(err)
+        
+    def properties_changed(self, interface, properties, invalidated, path):
+        if path != self.transfer_path:
+            return
+
+        if "Status" in properties and \
+                (properties["Status"] == "complete" or \
+                properties["Status"] == "error"):
+            return
+
+        if "Transferred" not in properties:
+            return
+
+        value = properties["Transferred"]
+        speed = (value - self.transferred) / 1000
+        #print("Transfer progress %d/%d at %d kBps" % (value,
+        #                    self.transfer_size,
+        #                    speed))
+        self.transferred = value
+
+    def pull_business_card(self, filename):
+        self.opp.PullBusinessCard(os.path.abspath(filename),
+                reply_handler=self.create_transfer_reply,
+                error_handler=self.error)
+
+    def send_file(self, filename):
+        self.opp.SendFile(os.path.abspath(filename),
+                reply_handler=self.create_transfer_reply,
+                error_handler=self.error)
+
+
+class SendTo:
+    def select_files(self ,par):
+        d = Gtk.FileChooserDialog("Select files to send", parent=par, buttons=("Cancel", Gtk.ResponseType.REJECT,
+                                                                      "OK", Gtk.ResponseType.ACCEPT))
+        #d.props.icon_name = "blueman-send-file"
+        d.set_select_multiple(True)
+        resp = d.run()
+
+        if resp == Gtk.ResponseType.ACCEPT:
+            self.files = d.get_filenames()
+            d.destroy()
+            return True
+        else:
+            d.destroy()
+            return False
+
+label = Gtk.Label("Ready to receive files")
+
+class BluetoothTransfer(Gtk.Window):
+    def __init__(self, adapter):
+        Gtk.Window.__init__(self, title="Bluetooth Transfer")
+        self.box = Gtk.Box(spacing=16)
+        self.add(self.box)
+        self.box.pack_start(label, True, True, 0)
+
+        self.button = Gtk.Button(label="Send Files")
+        self.button.connect("clicked", self.on_button_clicked)
+        self.box.pack_start(self.button, True, True, 0)
+
+        self.resetbutton = Gtk.Button(label="Restart BT")
+        self.resetbutton.connect("clicked", self.on_reset_clicked)
+        self.box.pack_start(self.resetbutton, True, True, 0)
+        
+        self.helpbutton = Gtk.Button(label="Help")
+        self.helpbutton.connect("clicked", self.on_help_clicked)
+        self.box.pack_start(self.helpbutton, True, True, 0)
+
+        capability = "KeyboardDisplay"
+        bluezpath = "/test/bluez/agent"
+        bluezagent = BluezAgent(dbus.SystemBus(), bluezpath)
+        obj = dbus.SystemBus().get_object('org.bluez', "/org/bluez");
+        bluezmanager = dbus.Interface(obj, "org.bluez.AgentManager1")
+        bluezmanager.RegisterAgent(bluezpath, capability)
+        bluezmanager.RequestDefaultAgent(bluezpath)
+  
+        self.manager = dbus.Interface(dbus.SessionBus().get_object(BUS_NAME, PATH), AGENT_MANAGER_INTERFACE)
+        self.path = "/test/agent"
+        self.agent = Agent(dbus.SessionBus(), self.path)
+        try:
+            self.manager.UnregisterAgent(self.agent)
+        except: pass
+
+        self.manager.RegisterAgent(self.agent)        
+        self.connect("delete-event", Gtk.main_quit )
+        self.show_all()
+        Gtk.main()
+        self.manager.UnregisterAgent(self.agent)
+        bluezmanager.UnregisterAgent(bluezpath)
+        ret = check_output(["pidof","obexd"])
+        os.system("kill " + str(ret))
+
+    def on_reset_clicked(self,widget):
+        os.system("gksudo systemctl restart bluetooth.service")
+        python = sys.executable
+        os.execl(python, python, * sys.argv)
+        
+    def on_help_clicked(self, widget):
+        new = 2 # open in a new tab, if possible
+        url = "/usr/share/bluetoothtransfer/BluetoothTransfer.html"
+        webbrowser.open(url,new=new)
+
+    def on_button_clicked(self, widget):
+        devs = adapter.get_devices()
+        d = SelectDlg(devs, self)
+        resp = d.run()
+        d.destroy()
+        if resp == Gtk.ResponseType.ACCEPT:
+            send = SendTo()
+            if send.select_files(self) == True:                 
+                bus = dbus.SessionBus()
+                client = dbus.Interface(bus.get_object(BUS_NAME, PATH),
+                            CLIENT_INTERFACE)
+                try:
+                     path = client.CreateSession(d.GetSelection(), { "Target": "OPP" })
+                     opp_client = OppClient(path)
+                     for file in send.files:
+                         opp_client.send_file(file)
+                         label.set_text('Sending:' + file)
+                except  dbus.exceptions.DBusException:
+                     label.set_text('Sending failed! Set bluetooth on in your phone.')
+            else:
+                return False      
+
+class SelectDlg(Gtk.Dialog):  
+    def __init__(self, devs, parent=None, title="Select Device"):
+        Gtk.Dialog.__init__(self, title, parent, 0, ("Cancel", Gtk.ResponseType.REJECT,
+                                                     "OK", Gtk.ResponseType.ACCEPT))
+        self.Alias = None
+        self.Address = None 
+        self.devices = devs
+        self.set_size_request(350, 250)    
+        sw = Gtk.ScrolledWindow()
+        store = self.create_model()
+
+        treeView = Gtk.TreeView(store)
+        select = treeView.get_selection()
+        select.connect("changed",self.on_tree_selection_changed)
+       
+        treeView.set_rules_hint(True)
+        sw.add(treeView)
+
+        self.create_columns(treeView)
+        align = Gtk.Alignment.new(0.5, 0.5, 1.0, 1.0)
+        align.add(sw)
+        align.set_padding(6, 6, 6, 6)
+        align.show()
+        self.vbox.pack_start(align, True, True, 0)
+        self.show_all()
+
+    def create_model(self):
+        store = Gtk.ListStore(str, str)
+
+        for act in self.devices:
+            store.append([act[0], act[1]])
+        return store
+
+    def create_columns(self, treeView):
+        rendererText = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn("Alias", rendererText, text=0)
+        column.set_sort_column_id(0)    
+        treeView.append_column(column)
+        
+        rendererText = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn("Address", rendererText, text=1)
+        column.set_sort_column_id(1)
+        treeView.append_column(column)
+     
+    def on_tree_selection_changed(self, selection):
+        model, treeiter = selection.get_selected()
+        if treeiter != None:
+            self.Alias = model[treeiter][0]
+            self.Address = model[treeiter][1]
+            
+    def GetSelection(self):
+        return self.Address
+        
+if __name__ == '__main__':     
+    adapter = Adapter()
+    BluetoothTransfer(adapter)

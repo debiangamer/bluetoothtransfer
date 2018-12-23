@@ -1,0 +1,9 @@
+Package: bluetoothtransfer
+Architecture: all
+Maintainer: fin4478 <fin4478@hotmail.com>
+Section: xfce
+Depends: python3 (>= 3.00), gir1.2-gtk-3.0 (>= 3.22.26-2)
+Priority: optional
+Version: 1.0
+Description: Bluetooth transfer application
+ Handles bluetooth file transfer and device pairing.
